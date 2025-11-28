@@ -335,6 +335,7 @@
              this.captureThreshold = 8; // Relaxed capture distance (was 5)
              this.lowArc = R_EARTH + 10; // Atmosphere-skimming transfer shell
              this.approachComplete = false;
+             this.captureBlend = 0;
 
              // Start at Hub
              this.pos = hubGroup.position.clone();
@@ -401,6 +402,7 @@
                     this.state = 'TRANSIT_IN';
                      this.mesh.material.color.setHex(0x00ffaa); // Green for haul
                      this.tether.material.opacity = 1;
+                     this.captureBlend = 0;
                  }
             }
             else if (this.state === 'TRANSIT_IN') {
@@ -408,9 +410,12 @@
                 // Haul payload back to Hub following a great-circle arc
                 this.pos.copy(moveOnOrbitalShell(this.pos, HUB_POS, SPEED * 0.7, { radiusLerp: 0.35 }));
 
-                // Sync Payload: Position it slightly behind the drone on the orbital path
+                // Sync Payload: Ease the tether so the payload is gently tugged instead of snapping
+                this.captureBlend = Math.min(1, this.captureBlend + dt * 1.5);
                 const droneDir = this.pos.clone().normalize();
-                 this.target.pos.copy(this.pos).sub(droneDir.multiplyScalar(4));
+                const towPoint = this.pos.clone().sub(droneDir.multiplyScalar(4));
+                const followStrength = 1 - Math.exp(-(2 + 4 * this.captureBlend) * dt);
+                this.target.pos.lerp(towPoint, followStrength);
 
                  // Update Tether
                  const tetherPoints = [this.pos, this.target.pos];
