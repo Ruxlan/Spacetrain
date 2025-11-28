@@ -189,16 +189,45 @@
     hubGroup.add(hubBody);
     hubGroup.add(hubLights);
 
-    // --- MATH HELPERS ---
-    function latLonToVector(lat, lon, r) {
-        const phi = (90 - lat) * (Math.PI / 180);
-        const theta = (lon + 180) * (Math.PI / 180);
-        return new THREE.Vector3(
-            -(r * Math.sin(phi) * Math.cos(theta)),
-            (r * Math.cos(phi)),
-            (r * Math.sin(phi) * Math.sin(theta))
-        );
-    }
+     // --- MATH HELPERS ---
+     function latLonToVector(lat, lon, r) {
+         const phi = (90 - lat) * (Math.PI / 180);
+         const theta = (lon + 180) * (Math.PI / 180);
+         return new THREE.Vector3(
+             -(r * Math.sin(phi) * Math.cos(theta)),
+             (r * Math.cos(phi)),
+             (r * Math.sin(phi) * Math.sin(theta))
+         );
+     }
+
+     function moveOnOrbitalShell(current, target, maxStep, options = {}) {
+         const { radiusLerp = 0.25, minRadius = R_EARTH + 2, maxRadius = ORBIT_RADIUS } = options;
+
+         const currentDir = current.clone().normalize();
+         const targetDir = target.clone().normalize();
+
+         // If we're already aligned, snap to blended radius
+         const angle = currentDir.angleTo(targetDir);
+         const targetRadius = THREE.MathUtils.clamp(
+             THREE.MathUtils.lerp(current.length(), target.length(), radiusLerp),
+             minRadius,
+             maxRadius
+         );
+         if (angle < 1e-4) {
+             return targetDir.multiplyScalar(targetRadius);
+         }
+
+         const step = Math.min(maxStep, angle);
+         const axis = currentDir.clone().cross(targetDir);
+
+         if (axis.lengthSq() < 1e-8) {
+             // Opposing or identical directions: pick a stable axis
+             axis.set(0, 1, 0);
+         }
+
+         const quat = new THREE.Quaternion().setFromAxisAngle(axis.normalize(), step);
+         return currentDir.clone().applyQuaternion(quat).normalize().multiplyScalar(targetRadius);
+     }
 
     // --- CLASSES ---
 
@@ -207,7 +236,10 @@
             this.active = true;
             this.captured = false;
             this.phase = 'LAUNCH'; // LAUNCH, INSERTION, ORBIT
-            
+            this.driftAxis = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.1, Math.random() - 0.5).normalize();
+            if (this.driftAxis.lengthSq() < 1e-4) { this.driftAxis.set(0, 1, 0); }
+            this.driftSpeed = 0.05 + Math.random() * 0.08;
+
             // 1. Pick Random City
             const city = CITIES[Math.floor(Math.random() * CITIES.length)];
             this.pos = latLonToVector(city.lat, city.lon, R_EARTH);
@@ -247,10 +279,9 @@
             else if (this.phase === 'ORBIT') {
                 // Only drift if not targeted/captured by a drone
                 if (!this.captured) {
-                    // Simple Rotation around Y axis
-                    const axis = new THREE.Vector3(0, 1, 0);
-                    const speed = 0.1 * dt;
-                    this.pos.applyAxisAngle(axis, speed);
+                    // Free-drift around a randomized orbital plane
+                    const speed = this.driftSpeed * dt;
+                    this.pos.applyAxisAngle(this.driftAxis, speed);
                 }
                 // If CAPTURED, position is locked to drone (managed by Drone class)
             }
@@ -266,115 +297,103 @@
         }
     }
 
-    class Drone {
-        constructor() {
-            this.state = 'IDLE'; // IDLE, TRANSIT_OUT, TRANSIT_IN
-            this.target = null;
-            this.captureThreshold = 8; // Relaxed capture distance (was 5)
-            
-            // Start at Hub
-            this.pos = hubGroup.position.clone();
-            
-            // Visuals
-            this.mesh = new THREE.Mesh(
-                new THREE.ConeGeometry(1.5, 4, 8),
-                new THREE.MeshBasicMaterial({ color: 0x00d2ff })
-            );
-            this.mesh.geometry.rotateX(Math.PI / 2); 
-            scene.add(this.mesh);
+     class Drone {
+         constructor() {
+             this.state = 'IDLE'; // IDLE, TRANSIT_OUT, TRANSIT_IN
+             this.target = null;
+             this.captureThreshold = 8; // Relaxed capture distance (was 5)
+             this.lowArc = R_EARTH + 10; // Atmosphere-skimming transfer shell
+             this.approachComplete = false;
 
-            // Tether
-            const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
-            this.tether = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0 }));
-            scene.add(this.tether);
-        }
+             // Start at Hub
+             this.pos = hubGroup.position.clone();
 
-        update(dt) {
-            const SPEED = 0.8 * dt; 
-            const HUB_POS = hubGroup.position;
+             // Visuals
+             this.mesh = new THREE.Mesh(
+                 new THREE.ConeGeometry(1.5, 4, 8),
+                 new THREE.MeshBasicMaterial({ color: 0x00d2ff })
+             );
+             this.mesh.geometry.rotateX(Math.PI / 2);
+             scene.add(this.mesh);
 
-            if (this.state === 'IDLE') {
-                // Park at Hub
-                this.pos.copy(HUB_POS);
-                
-                // Find Target
-                const p = projectiles.find(p => p.active && p.phase === 'ORBIT' && !p.captured);
-                if (p) {
-                    this.target = p;
-                    this.target.captured = true; // Lock target orbit drift now!
-                    this.state = 'TRANSIT_OUT';
-                }
-            }
-            else if (this.state === 'TRANSIT_OUT') {
-                if (!this.target.active) { this.state = 'IDLE'; return; }
+             // Tether
+             const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+             this.tether = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0 }));
+             scene.add(this.tether);
+         }
 
-                // Determine shortest angular path to target
-                const currentAngle = Math.atan2(this.pos.z, this.pos.x);
-                const targetAngle = Math.atan2(this.target.pos.z, this.target.pos.x);
-                
-                let diff = targetAngle - currentAngle;
-                if (diff > Math.PI) diff -= Math.PI * 2;
-                if (diff < -Math.PI) diff += Math.PI * 2;
+         update(dt) {
+             const SPEED = 0.8 * dt;
+             const HUB_POS = hubGroup.position;
 
-                // Move along the arc
-                const move = Math.sign(diff) * Math.min(Math.abs(diff), SPEED);
-                
-                // Apply rotation
-                const axis = new THREE.Vector3(0, 1, 0);
-                this.pos.applyAxisAngle(axis, move);
+             if (this.state === 'IDLE') {
+                 // Park at Hub
+                 this.pos.copy(HUB_POS);
+                 this.approachComplete = false;
 
-                this.mesh.lookAt(this.target.pos);
+                 // Find Target
+                 const p = projectiles.find(p => p.active && p.phase === 'ORBIT' && !p.captured);
+                 if (p) {
+                     this.target = p;
+                     this.target.captured = true; // Lock target orbit drift now!
+                     this.state = 'TRANSIT_OUT';
+                     this.approachComplete = false;
+                 }
+             }
+             else if (this.state === 'TRANSIT_OUT') {
+                 if (!this.target.active) { this.state = 'IDLE'; return; }
 
-                // Check distance - Use relaxed threshold
-                if (this.pos.distanceTo(this.target.pos) < this.captureThreshold) {
-                    this.state = 'TRANSIT_IN';
-                    this.mesh.material.color.setHex(0x00ffaa); // Green for haul
-                    this.tether.material.opacity = 1;
-                }
-            }
-            else if (this.state === 'TRANSIT_IN') {
-                // Haul payload back to Hub (which is on the X-axis, Angle 0)
-                
-                // Determine shortest angular path back to the hub
-                const currentAngle = Math.atan2(this.pos.z, this.pos.x);
-                const targetAngle = Math.atan2(HUB_POS.z, HUB_POS.x); // Angle of the hub (should be 0)
-                
-                let diff = targetAngle - currentAngle;
-                if (diff > Math.PI) diff -= Math.PI * 2;
-                if (diff < -Math.PI) diff += Math.PI * 2;
+                 // Stage 1: Dive to a lower transfer shell for global routing
+                 const approachVector = this.target.pos.clone().setLength(this.lowArc);
+                 if (!this.approachComplete) {
+                     this.pos.copy(moveOnOrbitalShell(this.pos, approachVector, SPEED, { radiusLerp: 0.4, minRadius: this.lowArc, maxRadius: ORBIT_RADIUS }));
+                     if (this.pos.distanceTo(approachVector) < 2) {
+                         this.approachComplete = true;
+                     }
+                 } else {
+                     // Stage 2: Rise back up toward the target's current shell
+                     this.pos.copy(moveOnOrbitalShell(this.pos, this.target.pos, SPEED, { radiusLerp: 0.35, minRadius: this.lowArc }));
+                 }
 
-                // Move slower when hauling
-                const move = Math.sign(diff) * Math.min(Math.abs(diff), SPEED * 0.7);
-                
-                const axis = new THREE.Vector3(0, 1, 0);
-                this.pos.applyAxisAngle(axis, move);
-                
-                // Sync Payload: Position it slightly behind the drone on the orbital path
-                const droneDir = this.pos.clone().normalize();
-                this.target.pos.copy(this.pos).sub(droneDir.multiplyScalar(4)); 
-                
-                // Update Tether
-                const tetherPoints = [this.pos, this.target.pos];
-                this.tether.geometry.setFromPoints(tetherPoints);
-                this.tether.geometry.attributes.position.needsUpdate = true;
+                 this.mesh.lookAt(this.target.pos);
 
-                this.mesh.lookAt(HUB_POS);
+                 // Check distance - Use relaxed threshold
+                 if (this.pos.distanceTo(this.target.pos) < this.captureThreshold) {
+                     this.state = 'TRANSIT_IN';
+                     this.mesh.material.color.setHex(0x00ffaa); // Green for haul
+                     this.tether.material.opacity = 1;
+                 }
+             }
+             else if (this.state === 'TRANSIT_IN') {
+                 // Haul payload back to Hub following a great-circle arc
+                 this.pos.copy(moveOnOrbitalShell(this.pos, HUB_POS, SPEED * 0.7, { radiusLerp: 0.35 }));
 
-                // Check arrival: Distance to the hub's fixed location
-                if (this.pos.distanceTo(HUB_POS) < 5) {
-                    // Deposit
-                    stats.stored++;
-                    this.target.remove();
-                    this.target = null;
-                    this.state = 'IDLE';
-                    this.mesh.material.color.setHex(0x00d2ff);
-                    this.tether.material.opacity = 0;
-                }
-            }
+                 // Sync Payload: Position it slightly behind the drone on the orbital path
+                 const droneDir = this.pos.clone().normalize();
+                 this.target.pos.copy(this.pos).sub(droneDir.multiplyScalar(4));
 
-            this.mesh.position.copy(this.pos);
-        }
-    }
+                 // Update Tether
+                 const tetherPoints = [this.pos, this.target.pos];
+                 this.tether.geometry.setFromPoints(tetherPoints);
+                 this.tether.geometry.attributes.position.needsUpdate = true;
+
+                 this.mesh.lookAt(HUB_POS);
+
+                 // Check arrival: Distance to the hub's fixed location
+                 if (this.pos.distanceTo(HUB_POS) < 5) {
+                     // Deposit
+                     stats.stored++;
+                     this.target.remove();
+                     this.target = null;
+                     this.state = 'IDLE';
+                     this.mesh.material.color.setHex(0x00d2ff);
+                     this.tether.material.opacity = 0;
+                 }
+             }
+
+             this.mesh.position.copy(this.pos);
+         }
+     }
 
     // --- MAIN LOOP ---
     const clock = new THREE.Clock();
